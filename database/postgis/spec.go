@@ -42,18 +42,22 @@ func (col *ColumnSpec) AsSQL() string {
 }
 
 func (spec *TableSpec) CreateTableSQL() string {
-	foundIdCol := false
+	foundIDCol := false
+	pkCols := []string{}
 	for _, cs := range spec.Columns {
 		if cs.Name == "id" {
-			foundIdCol = true
+			foundIDCol = true
+		}
+		if cs.FieldType.Name == "id" {
+			pkCols = append(pkCols, cs.Name)
 		}
 	}
 
 	cols := []string{}
-	if !foundIdCol {
-		// only add id column if there is no id configured
-		// TODO allow to disable id column?
-		cols = append(cols, "id SERIAL PRIMARY KEY")
+	if !foundIDCol {
+		// Create explicit id column only if there is no id configured.
+		cols = append(cols, "id SERIAL")
+		pkCols = append(pkCols, "id")
 	}
 
 	for _, col := range spec.Columns {
@@ -61,6 +65,12 @@ func (spec *TableSpec) CreateTableSQL() string {
 			continue
 		}
 		cols = append(cols, col.AsSQL())
+	}
+
+	// Make composite PRIMARY KEY of serial `id` and OSM ID. But only if the
+	// user did not provide a custom `id` colum which might not be unique.
+	if pkCols != nil && !foundIDCol {
+		cols = append(cols, `PRIMARY KEY ("`+strings.Join(pkCols, `", "`)+`")`)
 	}
 	columnSQL := strings.Join(cols, ",\n")
 	return fmt.Sprintf(`
@@ -79,7 +89,7 @@ func (spec *TableSpec) InsertSQL() string {
 	for _, col := range spec.Columns {
 		cols = append(cols, "\""+col.Name+"\"")
 		vars = append(vars,
-			col.Type.PrepareInsertSql(len(vars)+1, spec))
+			col.Type.PrepareInsertSQL(len(vars)+1, spec))
 	}
 	columns := strings.Join(cols, ", ")
 	placeholders := strings.Join(vars, ", ")
@@ -149,7 +159,6 @@ func NewTableSpec(pg *PostGIS, t *config.Table) (*TableSpec, error) {
 		pgType, ok := pgTypes[columnType.GoType]
 		if !ok {
 			return nil, errors.Errorf("unhandled column type %v, using string type", columnType)
-			pgType = pgTypes["string"]
 		}
 		col := ColumnSpec{column.Name, *columnType, pgType}
 		spec.Columns = append(spec.Columns, col)
@@ -163,7 +172,7 @@ func NewGeneralizedTableSpec(pg *PostGIS, t *config.GeneralizedTable) *Generaliz
 		FullName:   pg.Prefix + t.Name,
 		Schema:     pg.Config.ImportSchema,
 		Tolerance:  t.Tolerance,
-		Where:      t.SqlFilter,
+		Where:      t.SQLFilter,
 		SourceName: t.SourceTableName,
 	}
 	return &spec
@@ -204,7 +213,7 @@ func (spec *GeneralizedTableSpec) InsertSQL() string {
 
 	var cols []string
 	for _, col := range spec.Source.Columns {
-		cols = append(cols, col.Type.GeneralizeSql(&col, spec))
+		cols = append(cols, col.Type.GeneralizeSQL(&col, spec))
 	}
 
 	where := fmt.Sprintf(` WHERE "%s" = $1`, idColumnName)

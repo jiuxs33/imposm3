@@ -2,11 +2,12 @@ package stats
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"path"
 	"runtime/pprof"
 	"time"
+
+	"github.com/omniscale/imposm3/log"
 )
 
 func MemProfiler(dir string, interval time.Duration) {
@@ -16,7 +17,7 @@ func MemProfiler(dir string, interval time.Duration) {
 
 	ticker := time.NewTicker(interval)
 	i := 0
-	for _ = range ticker.C {
+	for range ticker.C {
 		filename := path.Join(
 			dir,
 			fmt.Sprintf("memprof-%03d.pprof", i),

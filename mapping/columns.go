@@ -6,14 +6,13 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/omniscale/imposm3/element"
+	osm "github.com/omniscale/go-osm"
+	"github.com/omniscale/imposm3/log"
+
 	"github.com/omniscale/imposm3/geom"
-	"github.com/omniscale/imposm3/logging"
 	"github.com/omniscale/imposm3/mapping/config"
 	"github.com/pkg/errors"
 )
-
-var log = logging.NewLogger("mapping")
 
 var AvailableColumnTypes map[string]ColumnType
 
@@ -21,7 +20,7 @@ func init() {
 	AvailableColumnTypes = map[string]ColumnType{
 		"bool":                 {"bool", "bool", Bool, nil, nil, false},
 		"boolint":              {"boolint", "int8", BoolInt, nil, nil, false},
-		"id":                   {"id", "int64", Id, nil, nil, false},
+		"id":                   {"id", "int64", ID, nil, nil, false},
 		"string":               {"string", "string", String, nil, nil, false},
 		"direction":            {"direction", "int8", Direction, nil, nil, false},
 		"integer":              {"integer", "int32", Integer, nil, nil, false},
@@ -41,11 +40,15 @@ func init() {
 		"zorder":               {"zorder", "int32", nil, MakeZOrder, nil, false},
 		"enumerate":            {"enumerate", "int32", nil, MakeEnumerate, nil, false},
 		"string_suffixreplace": {"string_suffixreplace", "string", nil, MakeSuffixReplace, nil, false},
+
+		"categorize_int":             {Name: "categorize_int", GoType: "int32", MakeFunc: MakeCategorizeInt},
+		"geojson_intersects":         {Name: "geojson_intersects", GoType: "bool", MakeFunc: MakeIntersectsField},
+		"geojson_intersects_feature": {Name: "geojson_intersects_feature", GoType: "string", MakeFunc: MakeIntersectsFeatureField},
 	}
 }
 
-type MakeValue func(string, *element.OSMElem, *geom.Geometry, Match) interface{}
-type MakeMemberValue func(*element.Relation, *element.Member, Match) interface{}
+type MakeValue func(string, *osm.Element, *geom.Geometry, Match) interface{}
+type MakeMemberValue func(*osm.Relation, *osm.Member, Match) interface{}
 
 type MakeMakeValue func(string, ColumnType, config.Column) (MakeValue, error)
 
@@ -61,25 +64,25 @@ type ColumnType struct {
 	FromMember bool
 }
 
-func Bool(val string, elem *element.OSMElem, geom *geom.Geometry, match Match) interface{} {
+func Bool(val string, elem *osm.Element, geom *geom.Geometry, match Match) interface{} {
 	if val == "" || val == "0" || val == "false" || val == "no" {
 		return false
 	}
 	return true
 }
 
-func BoolInt(val string, elem *element.OSMElem, geom *geom.Geometry, match Match) interface{} {
+func BoolInt(val string, elem *osm.Element, geom *geom.Geometry, match Match) interface{} {
 	if val == "" || val == "0" || val == "false" || val == "no" {
 		return 0
 	}
 	return 1
 }
 
-func String(val string, elem *element.OSMElem, geom *geom.Geometry, match Match) interface{} {
+func String(val string, elem *osm.Element, geom *geom.Geometry, match Match) interface{} {
 	return val
 }
 
-func Integer(val string, elem *element.OSMElem, geom *geom.Geometry, match Match) interface{} {
+func Integer(val string, elem *osm.Element, geom *geom.Geometry, match Match) interface{} {
 	v, err := strconv.ParseInt(val, 10, 32)
 	if err != nil {
 		return nil
@@ -87,40 +90,40 @@ func Integer(val string, elem *element.OSMElem, geom *geom.Geometry, match Match
 	return v
 }
 
-func Id(val string, elem *element.OSMElem, geom *geom.Geometry, match Match) interface{} {
-	return elem.Id
+func ID(val string, elem *osm.Element, geom *geom.Geometry, match Match) interface{} {
+	return elem.ID
 }
 
-func KeyName(val string, elem *element.OSMElem, geom *geom.Geometry, match Match) interface{} {
+func KeyName(val string, elem *osm.Element, geom *geom.Geometry, match Match) interface{} {
 	return match.Key
 }
 
-func ValueName(val string, elem *element.OSMElem, geom *geom.Geometry, match Match) interface{} {
+func ValueName(val string, elem *osm.Element, geom *geom.Geometry, match Match) interface{} {
 	return match.Value
 }
 
-func RelationMemberType(rel *element.Relation, member *element.Member, match Match) interface{} {
+func RelationMemberType(rel *osm.Relation, member *osm.Member, match Match) interface{} {
 	return member.Type
 }
 
-func RelationMemberRole(rel *element.Relation, member *element.Member, match Match) interface{} {
+func RelationMemberRole(rel *osm.Relation, member *osm.Member, match Match) interface{} {
 	return member.Role
 }
 
-func RelationMemberID(rel *element.Relation, member *element.Member, match Match) interface{} {
-	return member.Id
+func RelationMemberID(rel *osm.Relation, member *osm.Member, match Match) interface{} {
+	return member.ID
 }
 
-func RelationMemberIndex(rel *element.Relation, member *element.Member, match Match) interface{} {
+func RelationMemberIndex(rel *osm.Relation, member *osm.Member, match Match) interface{} {
 	for i := range rel.Members {
-		if rel.Members[i].Id == member.Id {
+		if rel.Members[i].ID == member.ID {
 			return i
 		}
 	}
 	return -1
 }
 
-func Direction(val string, elem *element.OSMElem, geom *geom.Geometry, match Match) interface{} {
+func Direction(val string, elem *osm.Element, geom *geom.Geometry, match Match) interface{} {
 	if val == "1" || val == "yes" || val == "true" {
 		return 1
 	} else if val == "-1" {
@@ -130,16 +133,19 @@ func Direction(val string, elem *element.OSMElem, geom *geom.Geometry, match Mat
 	}
 }
 
-func Geometry(val string, elem *element.OSMElem, geom *geom.Geometry, match Match) interface{} {
+func Geometry(val string, elem *osm.Element, geom *geom.Geometry, match Match) interface{} {
 	return string(geom.Wkb)
 }
 
 func MakePseudoArea(columnName string, columnType ColumnType, column config.Column) (MakeValue, error) {
-	log.Print("warn: pseudoarea type is deprecated and will be removed. See area and webmercarea type.")
+	log.Println("[warn] pseudoarea type is deprecated and will be removed. See area and webmerc_area type.")
 	return Area, nil
 }
 
-func Area(val string, elem *element.OSMElem, geom *geom.Geometry, match Match) interface{} {
+func Area(val string, elem *osm.Element, geom *geom.Geometry, match Match) interface{} {
+	if geom.Geom == nil {
+		return nil
+	}
 	area := geom.Geom.Area()
 	if area == 0.0 {
 		return nil
@@ -147,7 +153,10 @@ func Area(val string, elem *element.OSMElem, geom *geom.Geometry, match Match) i
 	return float32(area)
 }
 
-func WebmercArea(val string, elem *element.OSMElem, geom *geom.Geometry, match Match) interface{} {
+func WebmercArea(val string, elem *osm.Element, geom *geom.Geometry, match Match) interface{} {
+	if geom.Geom == nil {
+		return nil
+	}
 	area := geom.Geom.Area()
 	if area == 0.0 {
 		return nil
@@ -179,7 +188,7 @@ func MakeHStoreString(columnName string, columnType ColumnType, column config.Co
 		}
 
 	}
-	hstoreString := func(val string, elem *element.OSMElem, geom *geom.Geometry, match Match) interface{} {
+	hstoreString := func(val string, elem *osm.Element, geom *geom.Geometry, match Match) interface{} {
 		tags := make([]string, 0, len(elem.Tags))
 		for k, v := range elem.Tags {
 			if includeAll || include[k] != 0 {
@@ -206,7 +215,7 @@ func MakeWayZOrder(columnName string, columnType ColumnType, column config.Colum
 		defaultRank = int(val)
 	}
 
-	wayZOrder := func(val string, elem *element.OSMElem, geom *geom.Geometry, match Match) interface{} {
+	wayZOrder := func(val string, elem *osm.Element, geom *geom.Geometry, match Match) interface{} {
 		var z int
 		layer, _ := strconv.ParseInt(elem.Tags["layer"], 10, 64)
 		z += int(layer) * levelOffset
@@ -253,7 +262,7 @@ func init() {
 	}
 }
 
-func DefaultWayZOrder(val string, elem *element.OSMElem, geom *geom.Geometry, match Match) interface{} {
+func DefaultWayZOrder(val string, elem *osm.Element, geom *geom.Geometry, match Match) interface{} {
 	var z int
 	layer, _ := strconv.ParseInt(elem.Tags["layer"], 10, 64)
 	z += int(layer) * 10
@@ -280,7 +289,7 @@ func DefaultWayZOrder(val string, elem *element.OSMElem, geom *geom.Geometry, ma
 }
 
 func MakeZOrder(columnName string, columnType ColumnType, column config.Column) (MakeValue, error) {
-	log.Print("warn: zorder type is deprecated and will be removed. See enumerate type.")
+	log.Println("[warn] zorder type is deprecated and will be removed. See enumerate type.")
 	_rankList, ok := column.Args["ranks"]
 	if !ok {
 		return nil, errors.New("missing ranks in args for zorder")
@@ -310,7 +319,7 @@ func MakeZOrder(columnName string, columnType ColumnType, column config.Column) 
 		ranks[rankName] = len(rankList) - i
 	}
 
-	zOrder := func(val string, elem *element.OSMElem, geom *geom.Geometry, match Match) interface{} {
+	zOrder := func(val string, elem *osm.Element, geom *geom.Geometry, match Match) interface{} {
 		if key != "" {
 			if r, ok := ranks[elem.Tags[key]]; ok {
 				return r
@@ -331,7 +340,7 @@ func MakeEnumerate(columnName string, columnType ColumnType, column config.Colum
 	if err != nil {
 		return nil, err
 	}
-	enumerate := func(val string, elem *element.OSMElem, geom *geom.Geometry, match Match) interface{} {
+	enumerate := func(val string, elem *osm.Element, geom *geom.Geometry, match Match) interface{} {
 		if column.Key != "" {
 			if r, ok := values[val]; ok {
 				return r
@@ -390,7 +399,7 @@ func MakeSuffixReplace(columnName string, columnType ColumnType, column config.C
 		strChanges[k.(string)] = v.(string)
 	}
 	var suffixes []string
-	for k, _ := range strChanges {
+	for k := range strChanges {
 		suffixes = append(suffixes, k)
 	}
 	reStr := `(` + strings.Join(suffixes, "|") + `)\b`
@@ -400,7 +409,7 @@ func MakeSuffixReplace(columnName string, columnType ColumnType, column config.C
 		return strChanges[match]
 	}
 
-	suffixReplace := func(val string, elem *element.OSMElem, geom *geom.Geometry, match Match) interface{} {
+	suffixReplace := func(val string, elem *osm.Element, geom *geom.Geometry, match Match) interface{} {
 		if val != "" {
 			return re.ReplaceAllStringFunc(val, replFunc)
 		}
@@ -408,16 +417,4 @@ func MakeSuffixReplace(columnName string, columnType ColumnType, column config.C
 	}
 
 	return suffixReplace, nil
-}
-
-func asHex(b []byte) string {
-	digits := "0123456789ABCDEF"
-	buf := make([]byte, 0, len(b)*2)
-	n := len(b)
-
-	for i := 0; i < n; i++ {
-		c := b[i]
-		buf = append(buf, digits[c>>4], digits[c&0xF])
-	}
-	return string(buf)
 }

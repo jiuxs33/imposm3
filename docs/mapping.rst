@@ -5,6 +5,9 @@ The data mapping defines which `OSM feature types <http://wiki.openstreetmap.org
 
 See `example-mapping.yml <https://raw.githubusercontent.com/omniscale/imposm3/master/example-mapping.yml>`_ for an example.
 
+.. note::
+  The `YAML format <https://en.wikipedia.org/wiki/YAML>`_ uses indentations to indicate nesting. Tab characters are not allowed.
+  Quotes around simple strings are optional with YAML. ``"simple_string"``, ``'simple_string'`` and ``simple_string`` are all equal. However, numbers and boolean values (``yes``, ``no``, ``true``, ``false``) need to be quoted when they should be interpreted as a string (for example, when filtering ``building: ['no']``).
 
 Tables
 ------
@@ -92,14 +95,14 @@ Some column types require additional arguments. Refer to the documentation of th
 ``from_member`` is only valid for tables of the type ``relation_member``. If this is set to ``true``, then tags will be used from the member instead of the relation.
 
 
-``filter``
-~~~~~~~~~~
+``filters``
+~~~~~~~~~~~
 
 You can limit which elements should be inserted into a table with filters.
 You can ``require`` specific tags or ``reject`` elements that have specific tags.
 ``require`` and ``reject`` accept keys and a list of values, similar to a ``mapping``. You can use ``__any__`` to require or reject all values (e.g. ``amenity: [__any__]``).
 
-``require_regexp`` and ``reject_regexp`` can be used to filter values based on a regular expression.
+``require_regexp`` and ``reject_regexp`` can be used to filter values based on a regular expression. You can use the `Go Regex Tester <https://regex-golang.appspot.com/assets/html/index.html>`_ to test your regular expressions.
 
 The following mapping only imports buildings with a `name` tag. Buildings with ``building=no`` or ``building=none`` or buildings with a non-numeric level are not imported.
 
@@ -108,11 +111,11 @@ The following mapping only imports buildings with a `name` tag. Buildings with `
     tables:
       buildings:
         type: polygon
-        filter:
+        filters:
           require:
             name: [__any__]
           reject:
-            building: [no, none]
+            building: ['no', none]
           reject_regexp:
             level: '^\D+.*$'
         mapping:
@@ -123,6 +126,11 @@ The following mapping only imports buildings with a `name` tag. Buildings with `
 .. note::
 
   Regular expressions in ``require_regexp`` and ``reject_regexp`` should be enclosed in single quotes (``'``). Otherwise YAML will interpret backslashes as escape sequences.
+
+.. note::
+
+  You can only filter tags that are referenced in the ``mapping`` or ``columns`` of any table. See :ref:`tags` on how to make additional tags available for filtering.
+
 
 Example
 ~~~~~~~
@@ -262,6 +270,50 @@ Use ``default`` to set the default rank.
 A ``motorway`` will have a ``zorder`` value of 5, a ``residential`` with ``bridge=yes`` will be 8 (3+5).
 
 
+``categorize``
+^^^^^^^^^^^^^^
+
+Stores a number depending on a value, similar to ``enumerate``. However, ``categorize`` allows you to explicitly configure the number for each value, multiple values can have the same number and it can search in multiple keys. You can use this to implement a scale rank for sorting elements depending on their relative importance.
+
+
+::
+
+    - args:
+        default: 0
+        values: {
+          FR: 10, NL: 8, LU: 3,
+        }
+      keys:
+      - country_code_iso3166_1_alpha_2
+      - ISO3166-1:alpha2
+      - ISO3166-1
+      name: scalerank
+      type: categorize_int
+
+
+``geojson_intersects`` and ``geojson_intersects_field``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Checks whether the geometry of the element intersects geometries from a provided GeoJSON file. ``geojson_intersects`` returns true if it intersects any geometry. ``geojson_intersects_field`` returns a string property of the intersected feature.
+
+
+::
+
+    - args:
+        geojson: special_interest_areas.geojson
+      name: in_special_interest_area
+      type: geojson_intersects
+
+
+::
+
+    - args:
+        geojson: special_interest_areas.geojson
+        property: area
+      name: special_interest_area_name
+      type: geojson_intersects_field
+
+
 Element types
 ~~~~~~~~~~~~~
 
@@ -299,15 +351,10 @@ The geometry of the OSM element.
 Like `geometry`, but the geometries will be validated and repaired when this table is used as a source for a generalized table. Must only be used for `polygon` tables.
 
 
-``pseudoarea``
-^^^^^^^^^^^^^^
-
-Area of polygon geometries in square meters. This area is calculated in the webmercator projection, so it is only accurate at the equator and gets off the more the geometry moves to the poles. It's still good enough to sort features by area for rendering purposes.
-
 ``area``
 ^^^^^^^^
 
-Area of polygon geometries in the unit of the selected projection (m² or degrees²). Note that a `meter` in the webmercator projection is only accurate at the equator and gets off the more the geometry moves to the poles. It's still good enough to sort features by area for rendering purposes.
+Area of polygon geometries in the unit of the selected projection (m² or degrees²). Note that the area is only accurate at the equator for EPSG:4326 and EPSG:3857 and gets off the more the geometry moves to the poles. It's still good enough to sort features by area for rendering purposes.
 
 ``webmerc_area``
 ^^^^^^^^^^^^^^^^
@@ -427,7 +474,7 @@ You can configure these default interpretations with the ``areas`` option.
 .. code-block:: yaml
 
     areas:
-      area_tags: [buildings, landuse, leisure, natural, aeroway]
+      area_tags: [building, landuse, leisure, natural, aeroway]
       linear_tags: [highway, barrier]
 
 

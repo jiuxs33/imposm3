@@ -4,17 +4,14 @@ import (
 	"runtime"
 	"sync"
 
+	osm "github.com/omniscale/go-osm"
 	"github.com/omniscale/imposm3/cache"
 	"github.com/omniscale/imposm3/database"
-	"github.com/omniscale/imposm3/element"
 	"github.com/omniscale/imposm3/expire"
 	"github.com/omniscale/imposm3/geom/limit"
-	"github.com/omniscale/imposm3/logging"
 	"github.com/omniscale/imposm3/proj"
 	"github.com/omniscale/imposm3/stats"
 )
-
-var log = logging.NewLogger("writer")
 
 type ErrorLevel interface {
 	Level() int
@@ -64,7 +61,7 @@ func (writer *OsmElemWriter) Wait() {
 	writer.wg.Wait()
 }
 
-func (writer *OsmElemWriter) NodesToSrid(nodes []element.Node) {
+func (writer *OsmElemWriter) NodesToSrid(nodes []osm.Node) {
 	if writer.srid == 4326 {
 		return
 	}
@@ -77,7 +74,7 @@ func (writer *OsmElemWriter) NodesToSrid(nodes []element.Node) {
 	}
 }
 
-func (writer *OsmElemWriter) NodeToSrid(node *element.Node) {
+func (writer *OsmElemWriter) NodeToSrid(node *osm.Node) {
 	if writer.srid == 4326 {
 		return
 	}

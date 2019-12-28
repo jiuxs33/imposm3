@@ -4,7 +4,8 @@ import (
 	"io/ioutil"
 	"regexp"
 
-	"github.com/omniscale/imposm3/element"
+	osm "github.com/omniscale/go-osm"
+	"github.com/omniscale/imposm3/log"
 	"github.com/omniscale/imposm3/mapping/config"
 
 	"github.com/pkg/errors"
@@ -89,14 +90,17 @@ type Mapping struct {
 	RelationMemberMatcher RelationMatcher
 }
 
-func NewMapping(filename string) (*Mapping, error) {
-	f, err := ioutil.ReadFile(filename)
+func FromFile(filename string) (*Mapping, error) {
+	b, err := ioutil.ReadFile(filename)
 	if err != nil {
 		return nil, err
 	}
+	return New(b)
+}
 
+func New(b []byte) (*Mapping, error) {
 	mapping := Mapping{}
-	err = yaml.Unmarshal(f, &mapping.Conf)
+	err := yaml.Unmarshal(b, &mapping.Conf)
 	if err != nil {
 		return nil, err
 	}
@@ -268,7 +272,7 @@ func (m *Mapping) extraTags(tableType TableType, tags map[Key]bool) {
 	tags["area"] = true
 }
 
-type elementFilter func(tags element.Tags, key Key, closed bool) bool
+type elementFilter func(tags osm.Tags, key Key, closed bool) bool
 
 type tableElementFilters map[string][]elementFilter
 
@@ -293,7 +297,7 @@ func (m *Mapping) addTypedFilters(tableType TableType, filters tableElementFilte
 			continue
 		}
 		if TableType(t.Type) == LineStringTable && areaTags != nil {
-			f := func(tags element.Tags, key Key, closed bool) bool {
+			f := func(tags osm.Tags, key Key, closed bool) bool {
 				if closed {
 					if tags["area"] == "yes" {
 						return false
@@ -309,7 +313,7 @@ func (m *Mapping) addTypedFilters(tableType TableType, filters tableElementFilte
 			filters[name] = append(filters[name], f)
 		}
 		if TableType(t.Type) == PolygonTable && linearTags != nil {
-			f := func(tags element.Tags, key Key, closed bool) bool {
+			f := func(tags osm.Tags, key Key, closed bool) bool {
 				if closed && tags["area"] == "no" {
 					return false
 				}
@@ -329,7 +333,7 @@ func (m *Mapping) addRelationFilters(tableType TableType, filters tableElementFi
 	for name, t := range m.Conf.Tables {
 		if t.RelationTypes != nil {
 			relTypes := t.RelationTypes // copy loop var for closure
-			f := func(tags element.Tags, key Key, closed bool) bool {
+			f := func(tags osm.Tags, key Key, closed bool) bool {
 				if v, ok := tags["type"]; ok {
 					for _, rtype := range relTypes {
 						if v == rtype {
@@ -343,7 +347,7 @@ func (m *Mapping) addRelationFilters(tableType TableType, filters tableElementFi
 		} else {
 			if TableType(t.Type) == PolygonTable {
 				// standard multipolygon handling (boundary and land_area are for backwards compatibility)
-				f := func(tags element.Tags, key Key, closed bool) bool {
+				f := func(tags osm.Tags, key Key, closed bool) bool {
 					if v, ok := tags["type"]; ok {
 						if v == "multipolygon" || v == "boundary" || v == "land_area" {
 							return true
@@ -363,17 +367,17 @@ func (m *Mapping) addFilters(filters tableElementFilters) {
 			continue
 		}
 		if t.Filters.ExcludeTags != nil {
-			log.Print("warn: exclude_tags filter is deprecated and will be removed. See require and reject filter.")
+			log.Println("[warn]: exclude_tags filter is deprecated and will be removed. See require and reject filter.")
 			for _, filterKeyVal := range *t.Filters.ExcludeTags {
 				// Convert `exclude_tags`` filter to `reject` filter !
-				keyname := string(filterKeyVal[0])
+				keyname := filterKeyVal[0]
 				vararr := []config.OrderedValue{
 					{
 						Value: config.Value(filterKeyVal[1]),
 						Order: 1,
 					},
 				}
-				filters[name] = append(filters[name], makeFiltersFunction(name, false, true, string(keyname), vararr))
+				filters[name] = append(filters[name], makeFiltersFunction(name, false, true, keyname, vararr))
 
 			}
 		}
@@ -414,10 +418,10 @@ func findValueInOrderedValue(v config.Value, list []config.OrderedValue) bool {
 	return false
 }
 
-func makeRegexpFiltersFunction(tablename string, virtualTrue bool, virtualFalse bool, vKeyname string, vRegexp string) func(tags element.Tags, key Key, closed bool) bool {
+func makeRegexpFiltersFunction(tablename string, virtualTrue bool, virtualFalse bool, vKeyname string, vRegexp string) func(tags osm.Tags, key Key, closed bool) bool {
 	// Compile regular expression,  if not valid regexp --> panic !
 	r := regexp.MustCompile(vRegexp)
-	return func(tags element.Tags, key Key, closed bool) bool {
+	return func(tags osm.Tags, key Key, closed bool) bool {
 		if v, ok := tags[vKeyname]; ok {
 			if r.MatchString(v) {
 				return virtualTrue
@@ -427,24 +431,24 @@ func makeRegexpFiltersFunction(tablename string, virtualTrue bool, virtualFalse 
 	}
 }
 
-func makeFiltersFunction(tablename string, virtualTrue bool, virtualFalse bool, vKeyname string, vVararr []config.OrderedValue) func(tags element.Tags, key Key, closed bool) bool {
+func makeFiltersFunction(tablename string, virtualTrue bool, virtualFalse bool, vKeyname string, vVararr []config.OrderedValue) func(tags osm.Tags, key Key, closed bool) bool {
 
 	if findValueInOrderedValue("__nil__", vVararr) { // check __nil__
-		log.Print("warn: Filter value '__nil__' is not supported ! (tablename:" + tablename + ")")
+		log.Println("[warn] Filter value '__nil__' is not supported ! (tablename:" + tablename + ")")
 	}
 
 	if findValueInOrderedValue("__any__", vVararr) { // check __any__
 		if len(vVararr) > 1 {
-			log.Print("warn: Multiple filter value with '__any__' keywords is not valid! (tablename:" + tablename + ")")
+			log.Println("[warn] Multiple filter value with '__any__' keywords is not valid! (tablename:" + tablename + ")")
 		}
-		return func(tags element.Tags, key Key, closed bool) bool {
+		return func(tags osm.Tags, key Key, closed bool) bool {
 			if _, ok := tags[vKeyname]; ok {
 				return virtualTrue
 			}
 			return virtualFalse
 		}
 	} else if len(vVararr) == 1 { //  IF 1 parameter  THEN we can generate optimal code
-		return func(tags element.Tags, key Key, closed bool) bool {
+		return func(tags osm.Tags, key Key, closed bool) bool {
 			if v, ok := tags[vKeyname]; ok {
 				if config.Value(v) == vVararr[0].Value {
 					return virtualTrue
@@ -453,7 +457,7 @@ func makeFiltersFunction(tablename string, virtualTrue bool, virtualFalse bool, 
 			return virtualFalse
 		}
 	} else { //  > 1 parameter  - less optimal code
-		return func(tags element.Tags, key Key, closed bool) bool {
+		return func(tags osm.Tags, key Key, closed bool) bool {
 			if v, ok := tags[vKeyname]; ok {
 				if findValueInOrderedValue(config.Value(v), vVararr) {
 					return virtualTrue

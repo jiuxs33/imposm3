@@ -2,13 +2,15 @@ package postgis
 
 import (
 	"fmt"
+
+	"github.com/omniscale/imposm3/log"
 )
 
 type ColumnType interface {
 	Name() string
-	PrepareInsertSql(i int,
+	PrepareInsertSQL(i int,
 		spec *TableSpec) string
-	GeneralizeSql(colSpec *ColumnSpec, spec *GeneralizedTableSpec) string
+	GeneralizeSQL(colSpec *ColumnSpec, spec *GeneralizedTableSpec) string
 }
 
 type simpleColumnType struct {
@@ -19,20 +21,12 @@ func (t *simpleColumnType) Name() string {
 	return t.name
 }
 
-func (t *simpleColumnType) PrepareInsertSql(i int, spec *TableSpec) string {
+func (t *simpleColumnType) PrepareInsertSQL(i int, spec *TableSpec) string {
 	return fmt.Sprintf("$%d", i)
 }
 
-func (t *simpleColumnType) GeneralizeSql(colSpec *ColumnSpec, spec *GeneralizedTableSpec) string {
+func (t *simpleColumnType) GeneralizeSQL(colSpec *ColumnSpec, spec *GeneralizedTableSpec) string {
 	return "\"" + colSpec.Name + "\""
-}
-
-type hstoreColumnType struct {
-	simpleColumnType
-}
-
-func (t *hstoreColumnType) PrepareInsertSql(i int, spec *TableSpec) string {
-	return fmt.Sprintf("$%d::hstore", i)
 }
 
 type geometryType struct {
@@ -43,13 +37,13 @@ func (t *geometryType) Name() string {
 	return t.name
 }
 
-func (t *geometryType) PrepareInsertSql(i int, spec *TableSpec) string {
+func (t *geometryType) PrepareInsertSQL(i int, spec *TableSpec) string {
 	return fmt.Sprintf("$%d::Geometry",
 		i,
 	)
 }
 
-func (t *geometryType) GeneralizeSql(colSpec *ColumnSpec, spec *GeneralizedTableSpec) string {
+func (t *geometryType) GeneralizeSQL(colSpec *ColumnSpec, spec *GeneralizedTableSpec) string {
 	return fmt.Sprintf(`ST_SimplifyPreserveTopology("%s", %f) as "%s"`,
 		colSpec.Name, spec.Tolerance, colSpec.Name,
 	)
@@ -59,10 +53,10 @@ type validatedGeometryType struct {
 	geometryType
 }
 
-func (t *validatedGeometryType) GeneralizeSql(colSpec *ColumnSpec, spec *GeneralizedTableSpec) string {
+func (t *validatedGeometryType) GeneralizeSQL(colSpec *ColumnSpec, spec *GeneralizedTableSpec) string {
 	if spec.Source.GeometryType != "polygon" {
 		// TODO return warning earlier
-		log.Warnf("validated_geometry column returns polygon geometries for %s", spec.FullName)
+		log.Printf("[warn] validated_geometry column returns polygon geometries for %s", spec.FullName)
 	}
 	return fmt.Sprintf(`ST_Buffer(ST_SimplifyPreserveTopology("%s", %f), 0) as "%s"`,
 		colSpec.Name, spec.Tolerance, colSpec.Name,

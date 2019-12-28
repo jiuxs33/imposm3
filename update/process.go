@@ -1,80 +1,82 @@
 package update
 
 import (
-	"errors"
+	"context"
 	"fmt"
-	"io"
+	"os"
 	"path/filepath"
-	"runtime"
+	"strings"
 
+	"github.com/pkg/errors"
+
+	osm "github.com/omniscale/go-osm"
+	"github.com/omniscale/go-osm/parser/diff"
+	diffstate "github.com/omniscale/go-osm/state"
 	"github.com/omniscale/imposm3/cache"
 	"github.com/omniscale/imposm3/config"
 	"github.com/omniscale/imposm3/database"
 	_ "github.com/omniscale/imposm3/database/postgis"
-	"github.com/omniscale/imposm3/element"
 	"github.com/omniscale/imposm3/expire"
 	"github.com/omniscale/imposm3/geom/geos"
 	"github.com/omniscale/imposm3/geom/limit"
-	"github.com/omniscale/imposm3/logging"
+	"github.com/omniscale/imposm3/log"
 	"github.com/omniscale/imposm3/mapping"
-	"github.com/omniscale/imposm3/parser/diff"
 	"github.com/omniscale/imposm3/stats"
-	diffstate "github.com/omniscale/imposm3/update/state"
 	"github.com/omniscale/imposm3/writer"
 )
 
-var log = logging.NewLogger("diff")
+const LastStateFilename = "last.state.txt"
 
-func Diff() {
-	if config.BaseOptions.Quiet {
-		logging.SetQuiet(true)
+func Diff(baseOpts config.Base, files []string) {
+	if baseOpts.Quiet {
+		log.SetMinLevel(log.LInfo)
 	}
 
 	var geometryLimiter *limit.Limiter
-	if config.BaseOptions.LimitTo != "" {
+	if baseOpts.LimitTo != "" {
 		var err error
-		step := log.StartStep("Reading limitto geometries")
+		step := log.Step("Reading limitto geometries")
 		geometryLimiter, err = limit.NewFromGeoJSON(
-			config.BaseOptions.LimitTo,
-			config.BaseOptions.LimitToCacheBuffer,
-			config.BaseOptions.Srid,
+			baseOpts.LimitTo,
+			baseOpts.LimitToCacheBuffer,
+			baseOpts.Srid,
 		)
 		if err != nil {
-			log.Fatal(err)
+			log.Fatal("[fatal] Reading limitto geometry:", err)
 		}
-		log.StopStep(step)
+		step()
 	}
-	osmCache := cache.NewOSMCache(config.BaseOptions.CacheDir)
+	osmCache := cache.NewOSMCache(baseOpts.CacheDir)
 	err := osmCache.Open()
 	if err != nil {
-		log.Fatal("osm cache: ", err)
+		log.Fatal("[fatal] Opening OSM cache:", err)
 	}
 	defer osmCache.Close()
 
-	diffCache := cache.NewDiffCache(config.BaseOptions.CacheDir)
+	diffCache := cache.NewDiffCache(baseOpts.CacheDir)
 	err = diffCache.Open()
 	if err != nil {
-		log.Fatal("diff cache: ", err)
+		log.Fatal("[fatal] Opening diff cache:", err)
 	}
 
 	var exp expire.Expireor
 
-	if config.BaseOptions.ExpireTilesDir != "" {
-		tileexpire := expire.NewTileList(config.BaseOptions.ExpireTilesZoom, config.BaseOptions.ExpireTilesDir)
+	if baseOpts.ExpireTilesDir != "" {
+		tileexpire := expire.NewTileList(baseOpts.ExpireTilesZoom, baseOpts.ExpireTilesDir)
 		exp = tileexpire
 		defer func() {
 			if err := tileexpire.Flush(); err != nil {
-				log.Error("error while writing tile expire file:", err)
+				log.Println("[error] Writing tile expire file:", err)
 			}
 		}()
 	}
 
-	for _, oscFile := range config.DiffFlags.Args() {
-		err := Update(oscFile, geometryLimiter, exp, osmCache, diffCache, false)
+	for _, oscFile := range files {
+		err := Update(baseOpts, oscFile, geometryLimiter, exp, osmCache, diffCache, baseOpts.ForceDiffImport)
 		if err != nil {
 			osmCache.Close()
 			diffCache.Close()
-			log.Fatalf("unable to process %s: %v", oscFile, err)
+			log.Fatalf("[fatal] Unable to process %s: %v", oscFile, err)
 		}
 	}
 	// explicitly Close since os.Exit prevents defers
@@ -82,46 +84,70 @@ func Diff() {
 	diffCache.Close()
 }
 
-func Update(oscFile string, geometryLimiter *limit.Limiter, expireor expire.Expireor, osmCache *cache.OSMCache, diffCache *cache.DiffCache, force bool) error {
-	state, err := diffstate.FromOscGz(oscFile)
-	if err != nil {
-		return err
+func Update(
+	baseOpts config.Base,
+	oscFile string,
+	geometryLimiter *limit.Limiter,
+	expireor expire.Expireor,
+	osmCache *cache.OSMCache,
+	diffCache *cache.DiffCache,
+	force bool,
+) error {
+	var state *diffstate.DiffState
+	if strings.HasSuffix(oscFile, ".osc.gz") {
+		var err error
+		stateFile := oscFile[:len(oscFile)-len(".osc.gz")] + ".state.txt"
+		state, err = diffstate.ParseFile(stateFile)
+		if err != nil && !os.IsNotExist(err) {
+			return errors.Wrapf(err, "reading state %s", stateFile)
+		}
 	}
-	lastState, err := diffstate.ParseLastState(config.BaseOptions.DiffDir)
-	if err != nil {
-		log.Warn(err)
+	lastStateFile := filepath.Join(baseOpts.DiffDir, LastStateFilename)
+	lastState, err := diffstate.ParseFile(lastStateFile)
+	if err != nil && !os.IsNotExist(err) {
+		return errors.Wrapf(err, "parsing last state from %s", lastStateFile)
 	}
 
 	if lastState != nil && lastState.Sequence != 0 && state != nil && state.Sequence <= lastState.Sequence {
 		if !force {
-			log.Warn(state, " already imported")
+			log.Println("[warn] Skipping ", state, ", already imported")
 			return nil
 		}
 	}
 
-	defer log.StopStep(log.StartStep(fmt.Sprintf("Processing %s", oscFile)))
+	defer log.Step(fmt.Sprintf("Processing %s", oscFile))()
 
-	parser, err := diff.NewOscGzParser(oscFile)
-	if err != nil {
-		return err
+	diffs := make(chan osm.Diff)
+	config := diff.Config{
+		Diffs: diffs,
 	}
 
-	tagmapping, err := mapping.NewMapping(config.BaseOptions.MappingFile)
+	f, err := os.Open(oscFile)
+	if err != nil {
+		return errors.Wrap(err, "opening diff file")
+	}
+	defer f.Close()
+	parser, err := diff.NewGZIP(f, config)
+	if err != nil {
+		return errors.Wrap(err, "initializing diff parser")
+	}
+
+	tagmapping, err := mapping.FromFile(baseOpts.MappingFile)
 	if err != nil {
 		return err
 	}
 
 	dbConf := database.Config{
-		ConnectionParams: config.BaseOptions.Connection,
-		Srid:             config.BaseOptions.Srid,
+		ConnectionParams: baseOpts.Connection,
+		Srid:             baseOpts.Srid,
 		// we apply diff imports on the Production schema
-		ImportSchema:     config.BaseOptions.Schemas.Production,
-		ProductionSchema: config.BaseOptions.Schemas.Production,
-		BackupSchema:     config.BaseOptions.Schemas.Backup,
+		ImportSchema:     baseOpts.Schemas.Production,
+		ProductionSchema: baseOpts.Schemas.Production,
+		BackupSchema:     baseOpts.Schemas.Backup,
 	}
 	db, err := database.Open(dbConf, &tagmapping.Conf)
 	if err != nil {
-		return errors.New("database open: " + err.Error())
+		return errors.Wrap(err, "opening database")
 	}
 	defer db.Close()
 
@@ -144,7 +170,7 @@ func Update(oscFile string, geometryLimiter *limit.Limiter, expireor expire.Expi
 		delDb,
 		osmCache,
 		diffCache,
-		tagmapping.Conf.SingleIdSpace,
+		tagmapping.Conf.SingleIDSpace,
 		tagmapping.PointMatcher,
 		tagmapping.LineStringMatcher,
 		tagmapping.PolygonMatcher,
@@ -159,29 +185,29 @@ func Update(oscFile string, geometryLimiter *limit.Limiter, expireor expire.Expi
 	wayTagFilter := tagmapping.WayTagFilter()
 	nodeTagFilter := tagmapping.NodeTagFilter()
 
-	relations := make(chan *element.Relation)
-	ways := make(chan *element.Way)
-	nodes := make(chan *element.Node)
+	relations := make(chan *osm.Relation)
+	ways := make(chan *osm.Way)
+	nodes := make(chan *osm.Node)
 
 	relWriter := writer.NewRelationWriter(osmCache, diffCache,
-		tagmapping.Conf.SingleIdSpace,
+		tagmapping.Conf.SingleIDSpace,
 		relations,
 		db, progress,
 		tagmapping.PolygonMatcher,
 		tagmapping.RelationMatcher,
 		tagmapping.RelationMemberMatcher,
-		config.BaseOptions.Srid)
+		baseOpts.Srid)
 	relWriter.SetLimiter(geometryLimiter)
 	relWriter.SetExpireor(expireor)
 	relWriter.Start()
 
 	wayWriter := writer.NewWayWriter(osmCache, diffCache,
-		tagmapping.Conf.SingleIdSpace,
+		tagmapping.Conf.SingleIDSpace,
 		ways, db,
 		progress,
 		tagmapping.PolygonMatcher,
 		tagmapping.LineStringMatcher,
-		config.BaseOptions.Srid)
+		baseOpts.Srid)
 	wayWriter.SetLimiter(geometryLimiter)
 	wayWriter.SetExpireor(expireor)
 	wayWriter.Start()
@@ -189,27 +215,28 @@ func Update(oscFile string, geometryLimiter *limit.Limiter, expireor expire.Expi
 	nodeWriter := writer.NewNodeWriter(osmCache, nodes, db,
 		progress,
 		tagmapping.PointMatcher,
-		config.BaseOptions.Srid)
+		baseOpts.Srid)
 	nodeWriter.SetLimiter(geometryLimiter)
 	nodeWriter.SetExpireor(expireor)
 	nodeWriter.Start()
 
-	nodeIds := make(map[int64]struct{})
-	wayIds := make(map[int64]struct{})
-	relIds := make(map[int64]struct{})
+	nodeIDs := make(map[int64]struct{})
+	wayIDs := make(map[int64]struct{})
+	relIDs := make(map[int64]struct{})
 
-	step := log.StartStep("Parsing changes, updating cache and removing elements")
+	step := log.Step("Parsing changes, updating cache and removing elements")
 
 	g := geos.NewGeos()
 
-	for {
-		elem, err := parser.Next()
-		if err == io.EOF {
-			break // finished
-		}
-		if err != nil {
-			return diffError(err, "")
-		}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // make sure parser is stopped if we return early with an error
+
+	parseError := make(chan error)
+	go func() {
+		parseError <- parser.Parse(ctx)
+	}()
+
+	for elem := range diffs {
 		if elem.Rel != nil {
 			relTagFilter.Filter(&elem.Rel.Tags)
 			progress.AddRelations(1)
@@ -227,64 +254,64 @@ func Update(oscFile string, geometryLimiter *limit.Limiter, expireor expire.Expi
 		// always delete, to prevent duplicate elements from overlap of initial
 		// import and diff import
 		if err := deleter.Delete(elem); err != nil && err != cache.NotFound {
-			return diffError(err, "delete element %#v", elem)
+			return errors.Wrapf(err, "delete element %#v", elem)
 		}
-		if elem.Del {
+		if elem.Delete {
 			// no new or modified elem -> remove from cache
 			if elem.Rel != nil {
-				if err := osmCache.Relations.DeleteRelation(elem.Rel.Id); err != nil && err != cache.NotFound {
-					return diffError(err, "delete relation %v", elem.Rel)
+				if err := osmCache.Relations.DeleteRelation(elem.Rel.ID); err != nil && err != cache.NotFound {
+					return errors.Wrapf(err, "delete relation %v", elem.Rel)
 				}
 			} else if elem.Way != nil {
-				if err := osmCache.Ways.DeleteWay(elem.Way.Id); err != nil && err != cache.NotFound {
-					return diffError(err, "delete way %v", elem.Way)
+				if err := osmCache.Ways.DeleteWay(elem.Way.ID); err != nil && err != cache.NotFound {
+					return errors.Wrapf(err, "delete way %v", elem.Way)
 				}
-				if err := diffCache.Ways.Delete(elem.Way.Id); err != nil && err != cache.NotFound {
-					return diffError(err, "delete way references %v", elem.Way)
+				if err := diffCache.Ways.Delete(elem.Way.ID); err != nil && err != cache.NotFound {
+					return errors.Wrapf(err, "delete way references %v", elem.Way)
 				}
 			} else if elem.Node != nil {
-				if err := osmCache.Nodes.DeleteNode(elem.Node.Id); err != nil && err != cache.NotFound {
-					return diffError(err, "delete node %v", elem.Node)
+				if err := osmCache.Nodes.DeleteNode(elem.Node.ID); err != nil && err != cache.NotFound {
+					return errors.Wrapf(err, "delete node %v", elem.Node)
 				}
-				if err := osmCache.Coords.DeleteCoord(elem.Node.Id); err != nil && err != cache.NotFound {
-					return diffError(err, "delete coord %v", elem.Node)
+				if err := osmCache.Coords.DeleteCoord(elem.Node.ID); err != nil && err != cache.NotFound {
+					return errors.Wrapf(err, "delete coord %v", elem.Node)
 				}
 			}
 		}
-		if elem.Mod && elem.Node != nil && elem.Node.Tags == nil {
+		if elem.Modify && elem.Node != nil && elem.Node.Tags == nil {
 			// handle modifies where a node drops all tags
-			if err := osmCache.Nodes.DeleteNode(elem.Node.Id); err != nil && err != cache.NotFound {
-				return diffError(err, "delete node %v", elem.Node)
+			if err := osmCache.Nodes.DeleteNode(elem.Node.ID); err != nil && err != cache.NotFound {
+				return errors.Wrapf(err, "delete node %v", elem.Node)
 			}
 		}
-		if elem.Add || elem.Mod {
+		if elem.Create || elem.Modify {
 			if elem.Rel != nil {
 				// check if first member is cached to avoid caching
 				// unneeded relations (typical outside of our coverage)
 				cached, err := osmCache.FirstMemberIsCached(elem.Rel.Members)
 				if err != nil {
-					return diffError(err, "query first member %v", elem.Rel)
+					return errors.Wrapf(err, "query first member %v", elem.Rel)
 				}
 				if cached {
 					err := osmCache.Relations.PutRelation(elem.Rel)
 					if err != nil {
-						return diffError(err, "put relation %v", elem.Rel)
+						return errors.Wrapf(err, "put relation %v", elem.Rel)
 					}
-					relIds[elem.Rel.Id] = struct{}{}
+					relIDs[elem.Rel.ID] = struct{}{}
 				}
 			} else if elem.Way != nil {
 				// check if first coord is cached to avoid caching
 				// unneeded ways (typical outside of our coverage)
 				cached, err := osmCache.Coords.FirstRefIsCached(elem.Way.Refs)
 				if err != nil {
-					return diffError(err, "query first ref %v", elem.Way)
+					return errors.Wrapf(err, "query first ref %v", elem.Way)
 				}
 				if cached {
 					err := osmCache.Ways.PutWay(elem.Way)
 					if err != nil {
-						return diffError(err, "put way %v", elem.Way)
+						return errors.Wrapf(err, "put way %v", elem.Way)
 					}
-					wayIds[elem.Way.Id] = struct{}{}
+					wayIDs[elem.Way.ID] = struct{}{}
 				}
 			} else if elem.Node != nil {
 				addNode := true
@@ -296,57 +323,63 @@ func Update(oscFile string, geometryLimiter *limit.Limiter, expireor expire.Expi
 				if addNode {
 					err := osmCache.Nodes.PutNode(elem.Node)
 					if err != nil {
-						return diffError(err, "put node %v", elem.Node)
+						return errors.Wrapf(err, "put node %v", elem.Node)
 					}
-					err = osmCache.Coords.PutCoords([]element.Node{*elem.Node})
+					err = osmCache.Coords.PutCoords([]osm.Node{*elem.Node})
 					if err != nil {
-						return diffError(err, "put coord %v", elem.Node)
+						return errors.Wrapf(err, "put coord %v", elem.Node)
 					}
-					nodeIds[elem.Node.Id] = struct{}{}
+					nodeIDs[elem.Node.ID] = struct{}{}
 				}
 			}
 		}
 	}
 
 	// mark member ways from deleted relations for re-insert
-	for id, _ := range deleter.DeletedMemberWays() {
-		wayIds[id] = struct{}{}
+	for id := range deleter.DeletedMemberWays() {
+		wayIDs[id] = struct{}{}
 	}
 
 	progress.Stop()
-	log.StopStep(step)
-	step = log.StartStep("Writing added/modified elements")
+	step()
+
+	err = <-parseError
+	if err != nil {
+		return errors.Wrapf(err, "parsing diff %s", oscFile)
+	}
+
+	step = log.Step("Importing added/modified elements")
 
 	progress = stats.NewStatsReporter()
 
 	// mark depending ways for (re)insert
-	for nodeId, _ := range nodeIds {
-		dependers := diffCache.Coords.Get(nodeId)
+	for nodeID := range nodeIDs {
+		dependers := diffCache.Coords.Get(nodeID)
 		for _, way := range dependers {
-			wayIds[way] = struct{}{}
+			wayIDs[way] = struct{}{}
 		}
 	}
 
 	// mark depending relations for (re)insert
-	for nodeId, _ := range nodeIds {
-		dependers := diffCache.CoordsRel.Get(nodeId)
+	for nodeID := range nodeIDs {
+		dependers := diffCache.CoordsRel.Get(nodeID)
 		for _, rel := range dependers {
-			relIds[rel] = struct{}{}
+			relIDs[rel] = struct{}{}
 		}
 	}
-	for wayId, _ := range wayIds {
-		dependers := diffCache.Ways.Get(wayId)
+	for wayID := range wayIDs {
+		dependers := diffCache.Ways.Get(wayID)
 		// mark depending relations for (re)insert
 		for _, rel := range dependers {
-			relIds[rel] = struct{}{}
+			relIDs[rel] = struct{}{}
 		}
 	}
 
-	for relId, _ := range relIds {
-		rel, err := osmCache.Relations.GetRelation(relId)
+	for relID := range relIDs {
+		rel, err := osmCache.Relations.GetRelation(relID)
 		if err != nil {
 			if err != cache.NotFound {
-				return diffError(err, "could not get relation %v", relId)
+				return errors.Wrapf(err, "fetching cached relation %v", relID)
 			}
 			continue
 		}
@@ -355,11 +388,11 @@ func Update(oscFile string, geometryLimiter *limit.Limiter, expireor expire.Expi
 		relations <- rel
 	}
 
-	for wayId, _ := range wayIds {
-		way, err := osmCache.Ways.GetWay(wayId)
+	for wayID := range wayIDs {
+		way, err := osmCache.Ways.GetWay(wayID)
 		if err != nil {
 			if err != cache.NotFound {
-				return diffError(err, "could not get way %v", wayId)
+				return errors.Wrapf(err, "fetching cached way %v", wayID)
 			}
 			continue
 		}
@@ -368,11 +401,11 @@ func Update(oscFile string, geometryLimiter *limit.Limiter, expireor expire.Expi
 		ways <- way
 	}
 
-	for nodeId, _ := range nodeIds {
-		node, err := osmCache.Nodes.GetNode(nodeId)
+	for nodeID := range nodeIDs {
+		node, err := osmCache.Nodes.GetNode(nodeID)
 		if err != nil {
 			if err != cache.NotFound {
-				return diffError(err, "could not get node %v", nodeId)
+				return errors.Wrapf(err, "fetching cached node %v", nodeID)
 			}
 			// missing nodes can still be Coords
 			// no `continue` here
@@ -405,24 +438,18 @@ func Update(oscFile string, geometryLimiter *limit.Limiter, expireor expire.Expi
 		return err
 	}
 
-	log.StopStep(step)
+	step()
 
 	progress.Stop()
 
 	if state != nil {
 		if lastState != nil {
-			state.Url = lastState.Url
+			state.URL = lastState.URL
 		}
-		err = diffstate.WriteLastState(config.BaseOptions.DiffDir, state)
+		err = diffstate.WriteFile(filepath.Join(baseOpts.DiffDir, LastStateFilename), state)
 		if err != nil {
-			log.Warn(err) // warn only
+			log.Println("[error] Unable to write last state:", err)
 		}
 	}
 	return nil
-}
-
-func diffError(err error, msg string, args ...interface{}) error {
-	_, file, line, _ := runtime.Caller(1)
-	return fmt.Errorf("diff process error (%s:%d): %s %v",
-		filepath.Base(file), line, fmt.Sprintf(msg, args...), err)
 }

@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/omniscale/imposm3/element"
+	osm "github.com/omniscale/go-osm"
 	"github.com/omniscale/imposm3/proj"
 )
 
@@ -25,7 +25,7 @@ var mercRes [20]float64
 func init() {
 	res := 2 * 20037508.342789244 / 256
 
-	for i, _ := range mercRes {
+	for i := range mercRes {
 		mercRes[i] = res
 		res /= 2
 	}
@@ -54,12 +54,6 @@ type tileKey struct {
 	Y uint32
 }
 
-type tile struct {
-	x uint32
-	y uint32
-	z uint32
-}
-
 func NewTileList(zoom int, out string) *TileList {
 	return &TileList{
 		tiles: make(map[tileKey]struct{}),
@@ -73,7 +67,7 @@ func (tl *TileList) Expire(long, lat float64) {
 	tl.addCoord(long, lat)
 }
 
-func (tl *TileList) ExpireNodes(nodes []element.Node, closed bool) {
+func (tl *TileList) ExpireNodes(nodes []osm.Node, closed bool) {
 	if len(nodes) == 0 {
 		return
 	}
@@ -82,7 +76,7 @@ func (tl *TileList) ExpireNodes(nodes []element.Node, closed bool) {
 		tiles := numBboxTiles(box, tl.zoom)
 		if tiles > 500 {
 			tl.expireLine(nodes)
-		} else {
+		} else if !box.isEmpty() {
 			tl.expireBox(box)
 		}
 	} else {
@@ -107,7 +101,7 @@ func (tl *TileList) addCoord(long, lat float64) {
 
 // expireLine expires all tiles that are intersected by the line segments
 // between the nodes
-func (tl *TileList) expireLine(nodes []element.Node) {
+func (tl *TileList) expireLine(nodes []osm.Node) {
 	if len(nodes) == 1 {
 		tl.addCoord(nodes[0].Long, nodes[0].Lat)
 		return
@@ -115,6 +109,10 @@ func (tl *TileList) expireLine(nodes []element.Node) {
 	tl.mu.Lock()
 	defer tl.mu.Unlock()
 	for i := 0; i < len(nodes)-1; i++ {
+		// skip empty nodes (missing from cache)
+		if (nodes[i].Long == 0 && nodes[i].Lat == 0) || (nodes[i+1].Long == 0 && nodes[i+1].Lat == 0) {
+			continue
+		}
 		x1, y1 := tileCoord(nodes[i].Long, nodes[i].Lat, tl.zoom)
 		x2, y2 := tileCoord(nodes[i+1].Long, nodes[i+1].Lat, tl.zoom)
 		if int(x1) == int(x2) && int(y1) == int(y2) {
@@ -141,7 +139,7 @@ func (tl *TileList) expireBox(b bbox) {
 }
 
 func (tl *TileList) writeTiles(w io.Writer) error {
-	for tileKey, _ := range tl.tiles {
+	for tileKey := range tl.tiles {
 		_, err := fmt.Fprintf(w, "%d/%d/%d\n", tl.zoom, tileKey.X, tileKey.Y)
 		if err != nil {
 			return err
@@ -182,21 +180,29 @@ type bbox struct {
 	minx, miny, maxx, maxy float64
 }
 
-func nodesBbox(nodes []element.Node) bbox {
-	b := bbox{nodes[0].Long, nodes[0].Lat, nodes[0].Long, nodes[0].Lat}
+func (b bbox) isEmpty() bool {
+	return b == bbox{math.MaxFloat64, math.MaxFloat64, -math.MaxFloat64, -math.MaxFloat64}
+}
 
-	for i := 1; i < len(nodes); i++ {
-		if b.maxx < nodes[i].Long {
-			b.maxx = nodes[i].Long
+func nodesBbox(nodes []osm.Node) bbox {
+	b := bbox{math.MaxFloat64, math.MaxFloat64, -math.MaxFloat64, -math.MaxFloat64}
+
+	for _, nd := range nodes {
+		if nd.Lat == 0 && nd.Long == 0 {
+			continue
 		}
-		if b.maxy < nodes[i].Lat {
-			b.maxy = nodes[i].Lat
+
+		if b.maxx < nd.Long {
+			b.maxx = nd.Long
 		}
-		if b.minx > nodes[i].Long {
-			b.minx = nodes[i].Long
+		if b.maxy < nd.Lat {
+			b.maxy = nd.Lat
 		}
-		if b.miny > nodes[i].Lat {
-			b.miny = nodes[i].Lat
+		if b.minx > nd.Long {
+			b.minx = nd.Long
+		}
+		if b.miny > nd.Lat {
+			b.miny = nd.Lat
 		}
 	}
 	return b

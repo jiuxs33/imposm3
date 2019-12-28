@@ -6,10 +6,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/omniscale/imposm3/logging"
+	"github.com/omniscale/imposm3/log"
 )
-
-var log = logging.NewLogger("geojson")
 
 type object struct {
 	Type        string                 `json:"type"`
@@ -17,11 +15,6 @@ type object struct {
 	Geometry    *object                `json:"geometry"`
 	Coordinates []interface{}          `json:"coordinates"`
 	Properties  map[string]interface{} `json:"properties"`
-}
-
-type geometry struct {
-	Type        string        `json:"type"`
-	Coordinates []interface{} `json:"coordinates"`
 }
 
 type Point struct {
@@ -45,7 +38,7 @@ func newPointFromCoords(coords []interface{}) (Point, error) {
 	}
 
 	if p.Long > 180.0 || p.Long < -180.0 || p.Lat > 90.0 || p.Lat < -90.0 {
-		log.Warn("coordinates outside of world boundary. non-4326?: ", p)
+		log.Println("[warn] coordinates outside of world boundary. non-4326?: ", p)
 	}
 
 	return p, nil
@@ -71,11 +64,6 @@ func newLineStringFromCoords(coords []interface{}) (LineString, error) {
 }
 
 type Polygon []LineString
-
-type polygonFeature struct {
-	polygon    Polygon
-	properties map[string]string
-}
 
 type Feature struct {
 	Polygon    Polygon
@@ -162,7 +150,7 @@ func constructPolygonFeatures(obj *object) ([]Feature, error) {
 			return nil, err
 		}
 		properties := stringProperties(obj.Properties)
-		for i, _ := range features {
+		for i := range features {
 			features[i].Properties = properties
 		}
 		return features, err

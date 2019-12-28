@@ -9,15 +9,14 @@ import (
 	"sync/atomic"
 
 	pq "github.com/lib/pq"
+	osm "github.com/omniscale/go-osm"
 	"github.com/omniscale/imposm3/database"
-	"github.com/omniscale/imposm3/element"
 	"github.com/omniscale/imposm3/geom"
-	"github.com/omniscale/imposm3/logging"
+	"github.com/omniscale/imposm3/log"
 	"github.com/omniscale/imposm3/mapping"
 	"github.com/omniscale/imposm3/mapping/config"
+	"github.com/pkg/errors"
 )
-
-var log = logging.NewLogger("PostGIS")
 
 type SQLError struct {
 	query         string
@@ -164,7 +163,7 @@ func (pg *PostGIS) Init() error {
 
 // Finish creates spatial indices on all tables.
 func (pg *PostGIS) Finish() error {
-	defer log.StopStep(log.StartStep(fmt.Sprintf("Creating geometry indices")))
+	defer log.Step("Creating geometry indices")()
 
 	worker := int(runtime.GOMAXPROCS(0))
 	if worker < 1 {
@@ -176,7 +175,7 @@ func (pg *PostGIS) Finish() error {
 		tableName := tbl.FullName
 		table := tbl
 		p.in <- func() error {
-			return createIndex(pg, tableName, table.Columns)
+			return createIndex(pg, tableName, table.Columns, false)
 		}
 	}
 
@@ -184,7 +183,7 @@ func (pg *PostGIS) Finish() error {
 		tableName := tbl.FullName
 		table := tbl
 		p.in <- func() error {
-			return createIndex(pg, tableName, table.Source.Columns)
+			return createIndex(pg, tableName, table.Source.Columns, true)
 		}
 	}
 
@@ -196,24 +195,36 @@ func (pg *PostGIS) Finish() error {
 	return nil
 }
 
-func createIndex(pg *PostGIS, tableName string, columns []ColumnSpec) error {
+func createIndex(pg *PostGIS, tableName string, columns []ColumnSpec, generalizedTable bool) error {
+	foundIDCol := false
+	for _, cs := range columns {
+		if cs.Name == "id" {
+			foundIDCol = true
+		}
+	}
+
 	for _, col := range columns {
 		if col.Type.Name() == "GEOMETRY" {
 			sql := fmt.Sprintf(`CREATE INDEX "%s_geom" ON "%s"."%s" USING GIST ("%s")`,
 				tableName, pg.Config.ImportSchema, tableName, col.Name)
-			step := log.StartStep(fmt.Sprintf("Creating geometry index on %s", tableName))
+			step := log.Step(fmt.Sprintf("Creating geometry index on %s", tableName))
 			_, err := pg.Db.Exec(sql)
-			log.StopStep(step)
+			step()
 			if err != nil {
 				return err
 			}
 		}
-		if col.FieldType.Name == "id" {
+		if col.FieldType.Name == "id" && (foundIDCol || generalizedTable) {
+			// Create index for OSM ID required for diff updates, but only if
+			// the table does have an `id` column.
+			// The explicit `id` column prevented the creation of our composite
+			// PRIMARY KEY index of id (serial) and OSM ID.
+			// Generalized tables also do not have a PRIMARY KEY.
 			sql := fmt.Sprintf(`CREATE INDEX "%s_%s_idx" ON "%s"."%s" USING BTREE ("%s")`,
 				tableName, col.Name, pg.Config.ImportSchema, tableName, col.Name)
-			step := log.StartStep(fmt.Sprintf("Creating OSM id index on %s", tableName))
+			step := log.Step(fmt.Sprintf("Creating OSM id index on %s", tableName))
 			_, err := pg.Db.Exec(sql)
-			log.StopStep(step)
+			step()
 			if err != nil {
 				return err
 			}
@@ -223,9 +234,9 @@ func createIndex(pg *PostGIS, tableName string, columns []ColumnSpec) error {
 }
 
 func (pg *PostGIS) GeneralizeUpdates() error {
-	defer log.StopStep(log.StartStep(fmt.Sprintf("Updating generalized tables")))
+	defer log.Step("Updating generalized tables")()
 	for _, table := range pg.sortedGeneralizedTables() {
-		if ids, ok := pg.updatedIds[table]; ok {
+		if ids, ok := pg.updatedIDs[table]; ok {
 			for _, id := range ids {
 				pg.txRouter.Insert(table, []interface{}{id})
 			}
@@ -235,7 +246,7 @@ func (pg *PostGIS) GeneralizeUpdates() error {
 }
 
 func (pg *PostGIS) Generalize() error {
-	defer log.StopStep(log.StartStep(fmt.Sprintf("Creating generalized tables")))
+	defer log.Step("Creating generalized tables")()
 
 	worker := int(runtime.GOMAXPROCS(0))
 	if worker < 1 {
@@ -290,8 +301,8 @@ func (pg *PostGIS) Generalize() error {
 }
 
 func (pg *PostGIS) generalizeTable(table *GeneralizedTableSpec) error {
-	defer log.StopStep(log.StartStep(fmt.Sprintf("Generalizing %s into %s",
-		table.Source.FullName, table.FullName)))
+	defer log.Step(fmt.Sprintf("Generalizing %s into %s",
+		table.Source.FullName, table.FullName))()
 
 	tx, err := pg.Db.Begin()
 	if err != nil {
@@ -306,11 +317,11 @@ func (pg *PostGIS) generalizeTable(table *GeneralizedTableSpec) error {
 	var cols []string
 
 	for _, col := range table.Source.Columns {
-		cols = append(cols, col.Type.GeneralizeSql(&col, table))
+		cols = append(cols, col.Type.GeneralizeSQL(&col, table))
 	}
 
 	if err := dropTableIfExists(tx, pg.Config.ImportSchema, table.FullName); err != nil {
-		return err
+		return errors.Wrap(err, "dropping existing table")
 	}
 
 	columnSQL := strings.Join(cols, ",\n")
@@ -332,18 +343,18 @@ func (pg *PostGIS) generalizeTable(table *GeneralizedTableSpec) error {
 
 	isPG2, err := isPostGIS2(tx)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "detecting PostGIS version")
 	}
 	if !isPG2 {
 		err = populateGeometryColumn(tx, table.FullName, *table.Source)
 		if err != nil {
-			return err
+			return errors.Wrap(err, "populating GeometryColumn for PostGIS 2")
 		}
 	}
 
 	err = tx.Commit()
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "commiting tx for generalizes table %q", table.FullName)
 	}
 	tx = nil // set nil to prevent rollback
 	return nil
@@ -351,7 +362,7 @@ func (pg *PostGIS) generalizeTable(table *GeneralizedTableSpec) error {
 
 // Optimize clusters tables on new GeoHash index.
 func (pg *PostGIS) Optimize() error {
-	defer log.StopStep(log.StartStep(fmt.Sprintf("Clustering on geometry")))
+	defer log.Step("Clustering on geometry")()
 
 	worker := int(runtime.GOMAXPROCS(0))
 	if worker < 1 {
@@ -377,7 +388,7 @@ func (pg *PostGIS) Optimize() error {
 
 	err := p.wait()
 	if err != nil {
-		return err
+		return errors.Wrap(err, "optimizing database")
 	}
 
 	return nil
@@ -386,34 +397,34 @@ func (pg *PostGIS) Optimize() error {
 func clusterTable(pg *PostGIS, tableName string, srid int, columns []ColumnSpec) error {
 	for _, col := range columns {
 		if col.Type.Name() == "GEOMETRY" {
-			step := log.StartStep(fmt.Sprintf("Indexing %s on geohash", tableName))
+			step := log.Step(fmt.Sprintf("Indexing %q on geohash", tableName))
 			sql := fmt.Sprintf(`CREATE INDEX "%s_geom_geohash" ON "%s"."%s" (ST_GeoHash(ST_Transform(ST_SetSRID(Box2D(%s), %d), 4326)))`,
 				tableName, pg.Config.ImportSchema, tableName, col.Name, srid)
 			_, err := pg.Db.Exec(sql)
-			log.StopStep(step)
+			step()
 			if err != nil {
-				return err
+				return errors.Wrapf(err, "indexing %q on geohash", tableName)
 			}
 
-			step = log.StartStep(fmt.Sprintf("Clustering %s on geohash", tableName))
+			step = log.Step(fmt.Sprintf("Clustering %q on geohash", tableName))
 			sql = fmt.Sprintf(`CLUSTER "%s_geom_geohash" ON "%s"."%s"`,
 				tableName, pg.Config.ImportSchema, tableName)
 			_, err = pg.Db.Exec(sql)
-			log.StopStep(step)
+			step()
 			if err != nil {
-				return err
+				return errors.Wrapf(err, "clusering %q on geohash", tableName)
 			}
 			break
 		}
 	}
 
-	step := log.StartStep(fmt.Sprintf("Analysing %s", tableName))
+	step := log.Step(fmt.Sprintf("Analysing %q", tableName))
 	sql := fmt.Sprintf(`ANALYSE "%s"."%s"`,
 		pg.Config.ImportSchema, tableName)
 	_, err := pg.Db.Exec(sql)
-	log.StopStep(step)
+	step()
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "analyzing %q", tableName)
 	}
 
 	return nil
@@ -429,8 +440,8 @@ type PostGIS struct {
 	txRouter                *TxRouter
 	updateGeneralizedTables bool
 
-	updateIdsMu sync.Mutex
-	updatedIds  map[string][]int64
+	updateIDsMu sync.Mutex
+	updatedIDs  map[string][]int64
 }
 
 func (pg *PostGIS) Open() error {
@@ -438,17 +449,17 @@ func (pg *PostGIS) Open() error {
 
 	pg.Db, err = sql.Open("postgres", pg.Params)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "opening Postgres DB")
 	}
 	// check that the connection actually works
 	err = pg.Db.Ping()
 	if err != nil {
-		return err
+		return errors.Wrap(err, "ping Postgres DB")
 	}
 	return nil
 }
 
-func (pg *PostGIS) InsertPoint(elem element.OSMElem, geom geom.Geometry, matches []mapping.Match) error {
+func (pg *PostGIS) InsertPoint(elem osm.Element, geom geom.Geometry, matches []mapping.Match) error {
 	for _, match := range matches {
 		row := match.Row(&elem, &geom)
 		if err := pg.txRouter.Insert(match.Table.Name, row); err != nil {
@@ -458,28 +469,7 @@ func (pg *PostGIS) InsertPoint(elem element.OSMElem, geom geom.Geometry, matches
 	return nil
 }
 
-func (pg *PostGIS) InsertLineString(elem element.OSMElem, geom geom.Geometry, matches []mapping.Match) error {
-	for _, match := range matches {
-		row := match.Row(&elem, &geom)
-		if err := pg.txRouter.Insert(match.Table.Name, row); err != nil {
-			return err
-		}
-	}
-	if pg.updateGeneralizedTables {
-		genMatches := pg.generalizedFromMatches(matches)
-		if len(genMatches) > 0 {
-			pg.updateIdsMu.Lock()
-			for _, generalizedTable := range genMatches {
-				pg.updatedIds[generalizedTable.Name] = append(pg.updatedIds[generalizedTable.Name], elem.Id)
-
-			}
-			pg.updateIdsMu.Unlock()
-		}
-	}
-	return nil
-}
-
-func (pg *PostGIS) InsertPolygon(elem element.OSMElem, geom geom.Geometry, matches []mapping.Match) error {
+func (pg *PostGIS) InsertLineString(elem osm.Element, geom geom.Geometry, matches []mapping.Match) error {
 	for _, match := range matches {
 		row := match.Row(&elem, &geom)
 		if err := pg.txRouter.Insert(match.Table.Name, row); err != nil {
@@ -489,18 +479,39 @@ func (pg *PostGIS) InsertPolygon(elem element.OSMElem, geom geom.Geometry, match
 	if pg.updateGeneralizedTables {
 		genMatches := pg.generalizedFromMatches(matches)
 		if len(genMatches) > 0 {
-			pg.updateIdsMu.Lock()
+			pg.updateIDsMu.Lock()
 			for _, generalizedTable := range genMatches {
-				pg.updatedIds[generalizedTable.Name] = append(pg.updatedIds[generalizedTable.Name], elem.Id)
+				pg.updatedIDs[generalizedTable.Name] = append(pg.updatedIDs[generalizedTable.Name], elem.ID)
 
 			}
-			pg.updateIdsMu.Unlock()
+			pg.updateIDsMu.Unlock()
 		}
 	}
 	return nil
 }
 
-func (pg *PostGIS) InsertRelationMember(rel element.Relation, m element.Member, geom geom.Geometry, matches []mapping.Match) error {
+func (pg *PostGIS) InsertPolygon(elem osm.Element, geom geom.Geometry, matches []mapping.Match) error {
+	for _, match := range matches {
+		row := match.Row(&elem, &geom)
+		if err := pg.txRouter.Insert(match.Table.Name, row); err != nil {
+			return err
+		}
+	}
+	if pg.updateGeneralizedTables {
+		genMatches := pg.generalizedFromMatches(matches)
+		if len(genMatches) > 0 {
+			pg.updateIDsMu.Lock()
+			for _, generalizedTable := range genMatches {
+				pg.updatedIDs[generalizedTable.Name] = append(pg.updatedIDs[generalizedTable.Name], elem.ID)
+
+			}
+			pg.updateIDsMu.Unlock()
+		}
+	}
+	return nil
+}
+
+func (pg *PostGIS) InsertRelationMember(rel osm.Relation, m osm.Member, geom geom.Geometry, matches []mapping.Match) error {
 	for _, match := range matches {
 		row := match.MemberRow(&rel, &m, &geom)
 		if err := pg.txRouter.Insert(match.Table.Name, row); err != nil {
@@ -512,11 +523,15 @@ func (pg *PostGIS) InsertRelationMember(rel element.Relation, m element.Member, 
 
 func (pg *PostGIS) Delete(id int64, matches []mapping.Match) error {
 	for _, match := range matches {
-		pg.txRouter.Delete(match.Table.Name, id)
+		if err := pg.txRouter.Delete(match.Table.Name, id); err != nil {
+			return errors.Wrapf(err, "deleting %d from %q", id, match.Table.Name)
+		}
 	}
 	if pg.updateGeneralizedTables {
 		for _, generalizedTable := range pg.generalizedFromMatches(matches) {
-			pg.txRouter.Delete(generalizedTable.Name, id)
+			if err := pg.txRouter.Delete(generalizedTable.Name, id); err != nil {
+				return errors.Wrapf(err, "deleting %d from %q", id, generalizedTable.Name)
+			}
 		}
 	}
 	return nil
@@ -550,7 +565,7 @@ func (pg *PostGIS) sortedGeneralizedTables() []string {
 
 func (pg *PostGIS) EnableGeneralizeUpdates() {
 	pg.updateGeneralizedTables = true
-	pg.updatedIds = make(map[string][]int64)
+	pg.updatedIDs = make(map[string][]int64)
 }
 
 func (pg *PostGIS) Begin() error {
@@ -601,7 +616,7 @@ func New(conf database.Config, m *config.Mapping) (database.DB, error) {
 		// connStr is a URL
 		params, err = pq.ParseURL(connStr)
 		if err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "parsing database connection URL")
 		}
 	} else {
 		// connStr is already a params list (postgres: host=localhost ...)
@@ -614,19 +629,21 @@ func New(conf database.Config, m *config.Mapping) (database.DB, error) {
 	for name, table := range m.Tables {
 		db.Tables[name], err = NewTableSpec(db, table)
 		if err != nil {
-			return nil, err
+			return nil, errors.Wrapf(err, "creating table spec for %q", name)
 		}
 	}
 	for name, table := range m.GeneralizedTables {
 		db.GeneralizedTables[name] = NewGeneralizedTableSpec(db, table)
 	}
-	db.prepareGeneralizedTableSources()
+	if err := db.prepareGeneralizedTableSources(); err != nil {
+		return nil, errors.Wrap(err, "preparing generalized table sources")
+	}
 	db.prepareGeneralizations()
 
 	db.Params = params
 	err = db.Open()
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "opening db")
 	}
 	return db, nil
 }
@@ -634,14 +651,14 @@ func New(conf database.Config, m *config.Mapping) (database.DB, error) {
 // prepareGeneralizedTableSources checks if all generalized table have an
 // existing source and sets .Source to the original source (works even
 // when source is allready generalized).
-func (pg *PostGIS) prepareGeneralizedTableSources() {
+func (pg *PostGIS) prepareGeneralizedTableSources() error {
 	for name, table := range pg.GeneralizedTables {
 		if source, ok := pg.Tables[table.SourceName]; ok {
 			table.Source = source
 		} else if source, ok := pg.GeneralizedTables[table.SourceName]; ok {
 			table.SourceGeneralized = source
 		} else {
-			log.Printf("missing source '%s' for generalized table '%s'\n",
+			return errors.Errorf("missing source %q for generalized table %q",
 				table.SourceName, name)
 		}
 	}
@@ -658,6 +675,7 @@ func (pg *PostGIS) prepareGeneralizedTableSources() {
 			}
 		}
 	}
+	return nil
 }
 
 func (pg *PostGIS) prepareGeneralizations() {

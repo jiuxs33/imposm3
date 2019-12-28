@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/jmhodges/levigo"
-	"github.com/omniscale/imposm3/element"
+	osm "github.com/omniscale/go-osm"
 )
 
 var (
@@ -17,13 +17,12 @@ var (
 const SKIP int64 = -1
 
 type OSMCache struct {
-	dir          string
-	Coords       *DeltaCoordsCache
-	Ways         *WaysCache
-	Nodes        *NodesCache
-	Relations    *RelationsCache
-	InsertedWays *InsertedWaysCache
-	opened       bool
+	dir       string
+	Coords    *DeltaCoordsCache
+	Ways      *WaysCache
+	Nodes     *NodesCache
+	Relations *RelationsCache
+	opened    bool
 }
 
 func (c *OSMCache) Close() {
@@ -42,10 +41,6 @@ func (c *OSMCache) Close() {
 	if c.Relations != nil {
 		c.Relations.Close()
 		c.Relations = nil
-	}
-	if c.InsertedWays != nil {
-		c.InsertedWays.Close()
-		c.InsertedWays = nil
 	}
 }
 
@@ -74,11 +69,6 @@ func (c *OSMCache) Open() error {
 		return err
 	}
 	c.Relations, err = newRelationsCache(filepath.Join(c.dir, "relations"))
-	if err != nil {
-		c.Close()
-		return err
-	}
-	c.InsertedWays, err = newInsertedWaysCache(filepath.Join(c.dir, "inserted_ways"))
 	if err != nil {
 		c.Close()
 		return err
@@ -132,11 +122,11 @@ func (c *OSMCache) Remove() error {
 }
 
 // FirstMemberIsCached checks whether the first way or node member is cached.
-// Also returns true if there are no members of type WAY or NODE.
-func (c *OSMCache) FirstMemberIsCached(members []element.Member) (bool, error) {
+// Also returns true if there are no members of type WayMember or NodeMember.
+func (c *OSMCache) FirstMemberIsCached(members []osm.Member) (bool, error) {
 	for _, m := range members {
-		if m.Type == element.WAY {
-			_, err := c.Ways.GetWay(m.Id)
+		if m.Type == osm.WayMember {
+			_, err := c.Ways.GetWay(m.ID)
 			if err == NotFound {
 				return false, nil
 			}
@@ -144,8 +134,8 @@ func (c *OSMCache) FirstMemberIsCached(members []element.Member) (bool, error) {
 				return false, err
 			}
 			return true, nil
-		} else if m.Type == element.NODE {
-			_, err := c.Coords.GetCoord(m.Id)
+		} else if m.Type == osm.NodeMember {
+			_, err := c.Coords.GetCoord(m.ID)
 			if err == NotFound {
 				return false, nil
 			}
@@ -185,6 +175,11 @@ func (c *cache) open(path string) error {
 	if c.options.BlockSizeK > 0 {
 		opts.SetBlockSize(c.options.BlockSizeK * 1024)
 	}
+	if c.options.MaxFileSizeM > 0 {
+		// max file size option is only available with LevelDB 1.21 and higher
+		// build with -tags="ldppost121" to enable this option.
+		setMaxFileSize(opts, c.options.MaxFileSizeM*1024*1024)
+	}
 
 	db, err := levigo.Open(path, opts)
 	if err != nil {
@@ -193,6 +188,7 @@ func (c *cache) open(path string) error {
 	c.db = db
 	c.wo = levigo.NewWriteOptions()
 	c.ro = levigo.NewReadOptions()
+
 	return nil
 }
 
@@ -223,5 +219,4 @@ func (c *cache) Close() {
 		c.cache.Close()
 		c.cache = nil
 	}
-
 }

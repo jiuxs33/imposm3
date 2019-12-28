@@ -12,7 +12,7 @@ Vagrant.configure(2) do |config|
 
   # Every Vagrant development environment requires a box. You can search for
   # boxes at https://atlas.hashicorp.com/search.
-  config.vm.box = "puppetlabs/debian-6.0.10-64-nocm"
+  config.vm.box = "debian/jessie64"
 
   # Disable automatic box update checking. If you disable this, then
   # boxes will only be checked for updates when the user runs
@@ -64,5 +64,8 @@ Vagrant.configure(2) do |config|
   # Enable provisioning with a shell script. Additional provisioners such as
   # Puppet, Chef, Ansible, Salt, and Docker are also available. Please see the
   # documentation for more information about their specific syntax and use.
-  config.vm.provision "shell", args: ENV['REVISION'], path: 'packaging.sh'
+  config.vm.provision "shell", env: {
+    :REVISION => ENV['REVISION'],
+    :IMPOSM_BUILD_RELEASE => ENV['IMPOSM_BUILD_RELEASE']
+  }, path: 'packaging.sh'
 end

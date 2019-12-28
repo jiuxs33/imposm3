@@ -3,14 +3,13 @@
 cat <<EOF
 =================== Imposm Packaging Script ============================
 
-This script creates binary packages for Imposm 3 for Linux.
+This script creates binary packages for Imposm for Linux.
 It installs and builds all dependencies, compiles the master
 branch of this local repository and creates a .tar.gz with
 the imposm3 binary and all 3rd party dependencies.
 
-This script is made for Debian 6, so that the resulting binaries
-are compatible with older Linux distributions, namely SLES 11, RHEL 6,
-Ubuntu 10.04 and Debian 6.
+This script is made for Debian 8. The resulting binaries
+are compatible with Ubuntu 14.04, SLES 12, Fedora 21.
 
 'Vagrantfile' defines a working Debian VM that will call this script
 during the provision phase. Please install Vagrant and Virtualbox first:
@@ -44,7 +43,10 @@ EOF
 set -e
 # set -x
 
-REVISION=${1:-master}
+REVISION=${REVISION:-master}
+if [[ -z "$IMPOSM_BUILD_RELEASE" ]]; then
+    unset IMPOSM_BUILD_RELEASE
+fi
 
 BUILD_BASE=$HOME/imposm
 PREFIX=$BUILD_BASE/local
@@ -55,7 +57,10 @@ export GOROOT=$BUILD_BASE/go
 IMPOSM_SRC=$GOPATH/src/github.com/omniscale/imposm3
 BUILD_TMP=$BUILD_BASE/imposm-build
 
-GEOS_VERSION=3.5.1
+GEOS_VERSION=3.6.2
+
+# If set, build with HyperLevelDB instead of LevelDB
+#WITH_HYPERLEVELDB=1
 
 export CGO_CFLAGS=-I$PREFIX/include
 export CGO_LDFLAGS=-L$PREFIX/lib
@@ -64,39 +69,46 @@ export LD_LIBRARY_PATH=$PREFIX/lib
 CURL="curl --silent --show-error --location"
 
 mkdir -p $SRC
-mkdir -p $PREFIX
+mkdir -p $PREFIX/lib
+mkdir -p $PREFIX/include
 mkdir -p $GOPATH
 
 
-if ! grep --silent 'Debian GNU/Linux 6.0' /etc/issue; then
+if ! grep --silent 'Debian GNU/Linux 8' /etc/issue; then
     echo
-    echo "ERROR: This script only works for Debian 6.0 (Squeeze), see above."
+    echo "ERROR: This script only works for Debian 8.0 (Jessie), see above."
     exit 1
 fi
 
 if [ ! -e /usr/bin/git ]; then
     echo "-> installing dependencies"
 
-    # squeeze is EOL, use debian-archive
-    cat <<EOF | sudo tee /etc/apt/sources.list
-deb http://ftp.de.debian.org/debian-archive/debian squeeze main
-deb-src http://ftp.de.debian.org/debian-archive/debian squeeze main
-EOF
-
     sudo apt-get update -y
-    sudo apt-get install -y build-essential unzip autoconf libtool git-core chrpath
+    sudo apt-get install -y build-essential unzip autoconf libtool git chrpath curl
 fi
 
 if [ ! -e $BUILD_BASE/go/bin/go ]; then
     echo "-> installing go"
     pushd $SRC
-        rm -rf $BUILD_BASE/go
-        $CURL https://storage.googleapis.com/golang/go1.8.linux-amd64.tar.gz -O
-        tar xzf go1.8.linux-amd64.tar.gz -C $BUILD_BASE/
+        $CURL https://storage.googleapis.com/golang/go1.9.2.linux-amd64.tar.gz -O
+        tar xzf go1.9.2.linux-amd64.tar.gz -C $BUILD_BASE/
     popd
 fi
 
-if [ ! -e $PREFIX/lib/libhyperleveldb.so ]; then
+if [[ -z "$WITH_HYPERLEVELDB" && ! -e $PREFIX/lib/libleveldb.so ]]; then
+    echo "-> installing leveldb"
+    pushd $SRC
+        $CURL https://github.com/google/leveldb/archive/master.zip -L -O
+        unzip master.zip
+        pushd leveldb-master
+            make -j4
+            cp -R out-shared/liblevel* $PREFIX/lib/
+            cp -R include/leveldb $PREFIX/include/
+        popd
+    popd 
+fi
+
+if [[ -n "$WITH_HYPERLEVELDB" && ! -e $PREFIX/lib/libhyperleveldb.so ]]; then
     echo "-> installing hyperleveldb"
     pushd $SRC
         $CURL https://github.com/rescrv/HyperLevelDB/archive/master.zip -O
@@ -107,10 +119,10 @@ if [ ! -e $PREFIX/lib/libhyperleveldb.so ]; then
             make -j4
             make install
         popd
-    popd $SRC
+    popd
 fi
 
-if [ ! -e $PREFIX/include/leveldb ]; then
+if [[ -n "$WITH_HYPERLEVELDB" && ! -e $PREFIX/include/leveldb ]]; then
     echo "-> linking hyperleveldb as leveldb"
     pushd $PREFIX/lib
         for s in 'a', 'la', 'so'; do
@@ -162,7 +174,11 @@ pushd $IMPOSM_SRC
 
     echo '-> compiling imposm'
     make clean
-    make build
+    if [[ -n "$WITH_HYPERLEVELDB" ]]; then
+        make build
+    else
+        LEVELDB_POST_121=1 make build
+    fi
 popd
 
 
@@ -170,7 +186,8 @@ echo '-> building imposm package'
 rm -rf $BUILD_TMP
 mkdir -p $BUILD_TMP
 pushd $IMPOSM_SRC
-    cp imposm3 $BUILD_TMP
+    cp imposm $BUILD_TMP
+    cp README.md $BUILD_TMP
     cp example-mapping.json $BUILD_TMP/mapping.json
 popd
 
@@ -180,9 +197,13 @@ pushd $PREFIX/lib
     ln -s libgeos_c.so $BUILD_TMP/lib/libgeos_c.so.1
     cp libgeos.so $BUILD_TMP/lib
     ln -s libgeos.so $BUILD_TMP/lib/libgeos-$GEOS_VERSION.so
-    cp libhyperleveldb.so $BUILD_TMP/lib
-    ln -s libhyperleveldb.so $BUILD_TMP/lib/libhyperleveldb.so.0
-    ln -s libhyperleveldb.so $BUILD_TMP/lib/libleveldb.so.1
+    if [ -n "$WITH_HYPERLEVELDB" ]; then
+        cp libhyperleveldb.so $BUILD_TMP/lib
+        ln -s libhyperleveldb.so $BUILD_TMP/lib/libhyperleveldb.so.0
+        ln -s libhyperleveldb.so $BUILD_TMP/lib/libleveldb.so.1
+    else
+        cp -R libleveldb.so* $BUILD_TMP/lib
+    fi
 popd
 
 pushd $BUILD_TMP/lib
@@ -191,11 +212,17 @@ popd
 
 
 pushd $BUILD_BASE
-    VERSION=`$BUILD_TMP/imposm3 version`-linux-x86-64
-    rm -rf imposm3-$VERSION
-    mv imposm-build imposm3-$VERSION
-    tar zcvf imposm3-$VERSION.tar.gz imposm3-$VERSION
+    VERSION=`$BUILD_TMP/imposm version`-linux-x86-64
+    rm -rf imposm-$VERSION
+    mv imposm-build imposm-$VERSION
+    tar zcvf imposm-$VERSION.tar.gz imposm-$VERSION
     mkdir -p /vagrant/dist
-    mv imposm3-$VERSION.tar.gz /vagrant/dist/
-    echo "placed final package in: ./dist/imposm3-$VERSION.tar.gz"
+    mv imposm-$VERSION.tar.gz /vagrant/dist/
+
+    echo "###########################################################################"
+    echo " Call the following commands to download the created binary packages:"
+    echo
+    echo "vagrant ssh-config > .vagrant_ssh_conf"
+    echo "rsync -a -v -P -e 'ssh -F .vagrant_ssh_conf' default:/vagrant/dist ./dist"
+    echo "###########################################################################"
 popd

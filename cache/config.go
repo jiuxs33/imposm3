@@ -3,8 +3,9 @@ package cache
 import (
 	"encoding/json"
 	"io/ioutil"
-	"log"
 	"os"
+
+	"github.com/omniscale/imposm3/log"
 )
 
 type cacheOptions struct {
@@ -13,6 +14,7 @@ type cacheOptions struct {
 	BlockRestartInterval int
 	WriteBufferSizeM     int
 	BlockSizeK           int
+	MaxFileSizeM         int
 }
 
 type coordsCacheOptions struct {
@@ -21,13 +23,12 @@ type coordsCacheOptions struct {
 	BunchCacheCapacity int
 }
 type osmCacheOptions struct {
-	Coords       coordsCacheOptions
-	Ways         cacheOptions
-	Nodes        cacheOptions
-	Relations    cacheOptions
-	InsertedWays cacheOptions
-	CoordsIndex  cacheOptions
-	WaysIndex    cacheOptions
+	Coords      coordsCacheOptions
+	Ways        cacheOptions
+	Nodes       cacheOptions
+	Relations   cacheOptions
+	CoordsIndex cacheOptions
+	WaysIndex   cacheOptions
 }
 
 const defaultConfig = `
@@ -37,6 +38,7 @@ const defaultConfig = `
         "WriteBufferSizeM": 64,
         "BlockSizeK": 0,
         "MaxOpenFiles": 64,
+        "MaxFileSizeM": 32,
         "BlockRestartInterval": 256,
         "BunchSize": 32,
         "BunchCacheCapacity": 8096
@@ -46,6 +48,7 @@ const defaultConfig = `
         "WriteBufferSizeM": 64,
         "BlockSizeK": 0,
         "MaxOpenFiles": 64,
+        "MaxFileSizeM": 32,
         "BlockRestartInterval": 128
     },
     "Ways": {
@@ -53,6 +56,7 @@ const defaultConfig = `
         "WriteBufferSizeM": 64,
         "BlockSizeK": 0,
         "MaxOpenFiles": 64,
+        "MaxFileSizeM": 32,
         "BlockRestartInterval": 128
     },
     "Relations": {
@@ -60,20 +64,15 @@ const defaultConfig = `
         "WriteBufferSizeM": 64,
         "BlockSizeK": 0,
         "MaxOpenFiles": 64,
+        "MaxFileSizeM": 32,
         "BlockRestartInterval": 128
-    },
-    "InsertedWays": {
-        "CacheSizeM": 0,
-        "WriteBufferSizeM": 0,
-        "BlockSizeK": 0,
-        "MaxOpenFiles": 0,
-        "BlockRestartInterval": 0
     },
     "CoordsIndex": {
         "CacheSizeM": 32,
         "WriteBufferSizeM": 128,
         "BlockSizeK": 0,
         "MaxOpenFiles": 256,
+        "MaxFileSizeM": 8,
         "BlockRestartInterval": 256
     },
     "WaysIndex": {
@@ -81,6 +80,7 @@ const defaultConfig = `
         "WriteBufferSizeM": 64,
         "BlockSizeK": 0,
         "MaxOpenFiles": 64,
+        "MaxFileSizeM": 8,
         "BlockRestartInterval": 128
     }
 }
@@ -98,11 +98,11 @@ func init() {
 	if cacheConfFile != "" {
 		data, err := ioutil.ReadFile(cacheConfFile)
 		if err != nil {
-			log.Println("Unable to read cache config:", err)
+			log.Fatal("[fatal] Reading cache config:", err)
 		}
 		err = json.Unmarshal(data, &globalCacheOptions)
 		if err != nil {
-			log.Println("Unable to parse cache config:", err)
+			log.Fatal("[fatal] Parsing cache config:", err)
 		}
 	}
 }
